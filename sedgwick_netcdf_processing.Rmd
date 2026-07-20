@@ -1,0 +1,1069 @@
+---
+title: "sedgwick net cdf processing"
+output: html_document
+date: "2024-01-18"
+---
+
+## libraries
+```{r, warning=FALSE, results=FALSE}
+library(ncdf4)
+library(raster)
+library(sp)
+library(sf)
+library(maps)
+library(terra)
+library(sp)
+#library(ncdf4.helpers)
+library(ggplot2)
+library(tidyverse)
+```
+
+## Logic checks
+What is actually in each .nc file? Information:
+   3 variables (excluding dimension variables):
+      float XLAT[west_east,south_north]   (Contiguous storage)  
+          _FillValue: NaN
+          FieldType: 104
+          MemoryOrder: XY 
+          description: LATITUDE, SOUTH IS NEGATIVE
+          units: degree_north
+          stagger: 
+          coordinates: XLONG XLAT
+      float XLONG[west_east,south_north]   (Contiguous storage)  
+          _FillValue: NaN
+          FieldType: 104
+          MemoryOrder: XY 
+          description: LONGITUDE, WEST IS NEGATIVE
+          units: degree_east
+          stagger: 
+          coordinates: XLONG XLAT
+      double precsum[west_east,south_north,times]   (Contiguous storage)  
+          _FillValue: NaN
+          precsum: daily total precipitation K)
+          coordinates: XLONG XLAT
+   3 dimensions:
+      times  Size:366 
+          units: days since 1987-07-01 00:00:00
+          calendar: proleptic_gregorian
+      south_north  Size:234 (no dimvar)
+      west_east  Size:258 (no dimvar)
+
+What does this tell us? 
+- Data stored in 3D grid: x-direction (longitude, west_east dimension here), y-direction (latitude, south_north dimension here), time (daily)
+- 3 data variables (excluding dimension)
+- Model has 258 × 234 spatial points
+- Each value in times is a day offset from 1987-07-01 00:00:00 (standard Gregorian)
+
+- There are 3 data variables (excluding dimensions): XLAT, XLONG, and specific climate variable (precsum, relhum, etc.)
+- XLAT: degree_north, float, 2D grid [west_east, south_north], float data type
+- XLONG: degree_east (west is negative, not sure what this means), 2D grid [west_east,south_north], float data type
+- WRF grids are curvilinear (curvilinear orthogonal coordinates (often referred to as Arakawa C-grid or map projections) are used to represent the Earth's spherical surface on a 2D computational plane) 
+- Each grid cell has its own latitude and longitude
+- Together, XLAT + XLONG define the spatial location of every grid cell
+
+- Dimensions are ordered as [west_east, south_north, time] (more broadly: [x, y, time])
+- First index → longitude direction; second index → latitude direction; third index → time
+- For one grid cell, a daily time series is (example: precip): precsum[i, j, ] (to connect to geography: lat  <- XLAT[i, j], lon  <- XLONG[i, j])
+
+What is actually in the SWbasin_AvgFire file?
+- Datum: NAD83
+- Projection: UTM Zone 10 North
+- Units: meters
+- EPSG code: 26910 (totally reasonable for a basin raster (engineering/hydrology workflows often use UTM)
+- NOTE: WRF grid points live in EPSG:4326 (lon/lat) (must reproject the basin polygon)
+- WRF grids are curvilinear — projecting them introduces unnecessary distortion and complexity. Always project the basin to lon/lat instead
+
+Notes from debugging:
+- wrf_sub <- wrf_vect[basin_vect, ] does not work: SpatVector[i, j] is interpreted as attribute subsetting, not spatial, so basin_ll is being treated as an invalid row index. Result: an empty object with attribute names (ix, iy) and NAs. This is `terra()` specific, and is different from sf
+- x[y] performs spatial subsetting, intersect(x, y) gives us spatial intersection
+- basin_vect_proj <- project(basin_ll, crs(nc_example)) gives the following Error: [project] output crs is not valid. rast(nc_path) reads the raster from the NetCDF, while WRF NetCDF rasters often have a non-standard CRS internally. Terra sees it as a CRS, but it may not be a PROJ string that project() can handle. Even though the raster prints a CRS, terra cannot parse it for project()
+- Numbers from WRF data are usually grid indices, not degrees: an invalid NetCDF georeferencing situation. `terra()` thinks that the numbers it receives are latitude and longitude, but they're actually row and column indices. 
+
+| Object           | Lives in                                     |
+| ---------------- | -------------------------------------------- |
+| `wrf_sub$ix, iy` | **WRF index space**                          |
+| `r`              | **WRF index space (mis-labeled as lon/lat)** |
+| `XLAT / XLONG`   | **True geographic space**                    |
+| `basin_ll`       | **True geographic space**                    |
+
+
+# MOST RECENT CORRECT ATTEMPT BELOW:
+```{r}
+# define and reproject Sedgwick basin
+basin = rast("/Users/grace/rprojects/wrf_project/SWbasin_AvgFire")
+basin_vect = as.polygons(basin, dissolve = TRUE, na.rm = TRUE)
+basin_ll <- project(basin_vect, "EPSG:4326")
+
+# create WRF grid points from XLON/XLONG -- this is metadata for where wrf grid points are
+## choose example file
+nc <- nc_open("/Users/grace/rprojects/wrf_project/dly_prec/wrf.dlytotal.precip.1988.nc")
+lon <- ncvar_get(nc, "XLONG")
+lat <- ncvar_get(nc, "XLAT")
+dims <- dim(lon) 
+
+## flatten and index
+wrf_pts <- data.frame(lon = as.vector(lon), lat = as.vector(lat),
+  ix  = rep(seq_len(dims[1]), times = dims[2]), iy  = rep(seq_len(dims[2]), each  = dims[1]))
+head(wrf_pts)
+
+## convert to terra spatial vector (SpatVect)
+wrf_vect <- vect(wrf_pts, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+## crop using converted basin vector and with terra specific formatting
+wrf_sub <- wrf_vect[basin_ll] #contains only spatial metadata
+wrf_sub
+
+## sanity check for this step:
+# rel <- relate(wrf_vect, basin_ll, "intersects")
+# sum(rel) #109 overlaps
+
+## sanity checks: visual
+plot(wrf_sub, pch = ".", cex = 0.3)
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+```
+
+Process climate data
+```{r, process precip data}
+# loop over all precipitation information
+prec_dir <- "/Users/grace/rprojects/wrf_project/dly_prec"
+basin_nc_dir  <- "/Users/grace/rprojects/wrf_project/dly_prec_basin"
+if(!dir.exists(basin_nc_dir)) dir.create(basin_nc_dir)
+prec_files <- list.files(prec_dir, pattern = "\\.nc$", full.names = TRUE)
+
+# Load the basin subset metadata (grid indices)
+# wrf_sub must have ix, iy columns
+head(wrf_sub)
+
+process_prec_file <- function(nc_file, wrf_sub) {
+  # Read the raster
+  r <- rast(nc_file)
+  
+  n_days <- nlyr(r)
+  n_cells <- nrow(wrf_sub)
+  
+  # Pre-allocate output matrix: rows = grid cells, columns = days
+  basin_vals <- matrix(NA, nrow = n_cells, ncol = n_days)
+  
+  # Extract values using WRF grid indices
+  for (i in seq_len(n_cells)) {
+    ix <- wrf_sub$ix[i]
+    iy <- wrf_sub$iy[i]
+    basin_vals[i, ] <- as.numeric(r[iy, ix, ])
+  }
+  
+  # Convert cumulative -> daily
+  basin_vals_daily <- t(apply(basin_vals, 1, function(x) c(x[1], diff(x))))
+  
+  # Convert mm -> m
+  basin_vals_daily <- basin_vals_daily / 1000
+  
+  return(basin_vals_daily)
+}
+
+all_prec <- lapply(prec_files, process_prec_file, wrf_sub = wrf_sub)
+vals_combined <- do.call(cbind, all_prec) #combine all years along the time dimension (columns)
+stopifnot(!is.null(vals_combined))
+stopifnot(nrow(vals_combined) == nrow(wrf_sub))
+
+# sanity checks
+# Example with first cell
+ts_vec <- process_prec_file(prec_files[1], wrf_sub)[1, ]
+summary(ts_vec)
+plot(ts_vec, type = "l",
+     main = "Daily precipitation at first WRF basin cell",
+     xlab = "Day", ylab = "Precipitation (m)")
+
+# Quick check: number of NAs
+sum(is.na(ts_vec))
+
+# Use terra to create SpatRaster with proper dimensions
+n_cells <- nrow(wrf_sub)
+n_days <- ncol(vals_combined)
+
+# Create a raster stack with one layer per day
+ras_list <- lapply(1:n_days, function(day) {
+  # Convert column to matrix (rows x cols = 1 row per cell, 1 col)
+  mat <- matrix(vals_combined[, day], nrow = n_cells, ncol = 1)
+  rast(mat)
+})
+
+r_basin <- rast(ras_list)
+
+# Assign names
+names(r_basin) <- paste0("day_", 1:n_days)
+
+# Save
+writeRaster(r_basin, "/Users/grace/rprojects/wrf_project/dly_prec_basin/wrf_prec_basin.nc",
+            overwrite = TRUE, filetype = "netcdf")
+```
+
+```{r}
+# sanity checks for precip conversion overall
+## sanity check for location and convention
+r_check <- rast(merged_file)
+r_check
+
+## visual sanity check: single wrf cell (if that looks spiky and non-cumulative, you’re golden)
+## first convert
+r <- rast("/Users/grace/rprojects/wrf_project/dly_prec_basin/wrf.dlytotal.precip.1988.nc")
+r
+nlyr(r)
+
+# Pick a single WRF cell from your basin subset
+ix <- wrf_sub$ix[1]  # column index in WRF grid
+iy <- wrf_sub$iy[1]  # row index in WRF grid
+
+# Extract the time series for this cell
+# Use row/column indexing (index-space, NOT cell numbers)
+ts_vec <- as.numeric(r[iy, ix, ])  # extract all layers for that cell
+
+# Sanity check summaries
+summary(ts_vec)
+range(ts_vec, na.rm = TRUE)
+
+# Plot safely (guard against all NA)
+# ------------------------------
+if (all(is.na(ts_vec))) {
+  message("Warning: all values are NA. Check WRF indices or raster layers.")
+} else {
+  plot(ts_vec, type = "l",
+       xlab = "Day",
+       ylab = "Daily precipitation (m)",
+       main = paste("Daily precipitation at WRF cell (ix=", ix, ", iy=", iy, ")"))
+}
+
+## second visual sanity check, load merged basin NetCDF
+r <- rast("/Users/grace/rprojects/wrf_project/dly_prec_basin/wrf_precip_daily_basin_all_years.nc")
+crs(r) <- "EPSG:4326"
+day <- 100  #choose a day with precipitation (skip day 1 if it's often zero)
+plot(r[[day]],
+     main = paste("WRF daily precipitation – day", day),
+     col = hcl.colors(50, "Blues"))
+
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+
+## another sanity check: WRF points versus raster cells (check that you did not lose or shift WRF grid cells)
+plot(r[[day]],
+     main = "WRF grid alignment check",
+     col = hcl.colors(50, "Blues"))
+
+plot(wrf_sub, add = TRUE, col = "black", pch = 16, cex = 0.4)
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+
+## sanity check: distribution snapshot (spatial statistics, do values on this day look physically reasonable?)
+vals <- values(r[[day]])
+vals <- vals[!is.na(vals)]
+
+summary(vals)
+hist(vals, breaks = 40,
+     main = paste("Daily precipitation distribution – day", day),
+     xlab = "m/day")
+
+```
+
+```{r, check extraction -- for processing a single index of precip data}
+nc <- nc_open("/Users/grace/rprojects/wrf_project/dly_prec/wrf.dlytotal.precip.1988.nc")
+time <- ncvar_get(nc, "times")
+time_units <- ncatt_get(nc, "times", "units")$value
+time_origin <- sub("days since ", "", time_units)
+dates <- as.Date(time, origin = time_origin)
+head(dates)
+tail(dates)
+length(dates)
+
+i <- wrf_sub$ix[1]
+j <- wrf_sub$iy[1]
+
+prec <- ncvar_get(
+  nc,
+  "precsum",
+  start = c(i, j, 1),
+  count = c(1, 1, -1)
+)
+length(prec)       
+summary(prec)
+plot(dates, prec, type = "l")
+```
+
+## Make the base station from cleaned .nc files
+Make the base station itself - C code and R script mainly from Will
+```{r, make base station}
+# Requires
+#   - createbaseinfo_netcdf.c compiled binary
+# 
+# Inputs:
+#   - Processed/edited/subset aggregated (through time), netcdf climate data, processed in chunk above
+#   - Basin and DEM raster maps
+
+plots = T
+
+# ------------------------------ INPUTS ------------------------------
+# uncompiled source of the createbaseinfo_netcdf.c code
+ncbase_src = "/Users/grace/rprojects/wrf_project/createbaseinfo_netcdf.c"
+
+# USE SAME BASIN RASTER AS PRIOR
+basin = rast("/Users/grace/rprojects/wrf_project/SWbasin_AvgFire") 
+DEM = rast("/Users/grace/rprojects/wrf_project/SWdem30m.tif") #digital elevation model
+
+# location for maps to be used with base station creation
+map_dest = "/Users/grace/rprojects/wrf_project/netcdfmaps"
+
+# where to output a new zone map based on Netcdf grid
+zone_dest = "/Users/grace/rprojects/wrf_project/preprocessing_newzone"
+
+# specify climate files individually or via pattern, USE PROCESSED CLIMATE INPUTS FROM PREVIOUS SCRIPT 
+clim_files_final = list.files(path = "/Users/grace/rprojects/wrf_project/merged_files", pattern = "\\.nc$", full.names = T)
+
+# ------------------------------ END INPUTS ------------------------------
+
+# for later use
+basin_vect = as.polygons(basin)
+basin_vect_latlon = project(basin_vect, "EPSG:4326")
+
+# ------------------------------ GET GRID MAP FROM NETCDF ------------------------------
+# there are slight differences between getting the grid from the metadata elevation map and the 
+# netcdf already clipped using NCO. Using the clipped data from NCO as a default for now, but 
+# could easily be better the other way, code should be easy to toggle
+
+# commentary above is from will and I am just going to use the grid from my clipped climate net cdf files
+
+# ---------- Grid from clipped climate netcdf files ----------
+grid_from_clim = T
+if (grid_from_clim) {
+  # read in netcdf as raster, get only 1 day of precip
+  nc_grid_lonlat = rast(clim_files_final[1])[[1]]
+  # set values to sequential, change name
+  values(nc_grid_lonlat) = seq_along(values(nc_grid_lonlat))
+  names(nc_grid_lonlat) = "ID"
+  
+  # project to utm, mask to get zone/basestation map
+  nc_grid = project(nc_grid_lonlat, basin, method="near") #will's original line
+  
+  # resample basin back to new grid (so extents align for masking) -- this didn't work
+  #basin_resampled = resample(basin, nc_grid, method="near")
+  
+  # mask
+  id_grid = mask(nc_grid, basin)
+}
+
+# --------------- output the zone grid for use in preprocessing ---------------
+# maps need to be based on the netcdf latlong grid resolution + extent
+zone = mask(x = id_grid_proj, mask = basin) # will had x=id_grid_proj, replacing with id_grid didn't work
+writeRaster(id_grid, file.path(zone_dest, "zone_ids.tif"), overwrite=T)
+
+# ------------------------------ GENERATE INPUTS FOR NETCDF BASE STATION CREATION  ------------------------------
+# maps need to be based on the netcdf latlong grid resolution + extent
+demproj = project(DEM, "EPSG:4326")
+dem_nc = resample(demproj, nc_grid_lonlat, method="average")
+# LAI
+lai_nc = dem_nc
+values(lai_nc) = 3.0
+names(lai_nc) = "lai"
+
+if (!file.exists(map_dest)) {
+  dir.create(map_dest)
+}
+
+writeRaster(dem_nc, filename = file.path(map_dest,"dem.asc"), filetype="AAIGrid", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+writeRaster(lai_nc, filename = file.path(map_dest,"lai.asc"), filetype="AAIGrid", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+writeRaster(nc_grid_lonlat, filename = file.path(map_dest,"cellid.asc"), filetype="AAIGrid", datatype =  "INT4S", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+file.remove(list.files(path = map_dest, pattern = ".prj|.aux.xml", full.names = T))
+
+# format: ID ID Y X X Y
+
+xyid_loc = cbind(1:nrow(crds(nc_grid_lonlat)), 1:nrow(crds(nc_grid_lonlat)), crds(nc_grid_lonlat)[,c("y","x")], crds(nc_grid_lonlat))
+write.table(xyid_loc, file.path(map_dest,"xyid_loc.txt"), row.names = F, col.names = F)
+
+# ------------------------------ RUN C BIN TO GET BASE STATION  ------------------------------
+# COMPILE
+system(noquote(paste("bash -c \"", paste0("gcc ", ncbase_src, " -o ", file.path(map_dest,"create_netcdfbase")), "\"", sep = "")))
+
+# RUN -- YOU MAY NEED TO EDIT THIS, command should look like: ./create_netcdfbase cellid.asc lai.asc dem.asc xyid_loc.txt clim/ netcdf.base
+cmd = paste0(file.path(map_dest,"create_netcdfbase"), " ", file.path(map_dest,"cellid.asc"), " ", file.path(map_dest,"lai.asc"), " ",
+             file.path(map_dest,"dem.asc"), " ", file.path(map_dest,"xyid_loc.txt"), " ", dirname(clim_files_final[1]), "/ ", file.path(map_dest,"netcdf.base"))
+system(noquote(paste("bash -c \"",cmd ,"\"", sep = "")))
+```
+
+
+# ORIGINAL ATTEMPT BELOW:
+
+## extract GPS coordinates from WRF data 
+Code chunk shows the extent of latitude and longitude for WRF data from Charles, and compares it to the spatial extent of Sedgwick. 
+```{r}
+# extract coordinates for overall WRF data
+nc_file <- nc_open("/Users/grace/rprojects/wrf_project/dly_prec/wrf.dlytotal.precip.1988.nc")
+nc_file
+
+latitude <- ncvar_get(nc_file, "XLAT")
+longitude <- ncvar_get(nc_file, "XLONG")
+nc_close
+
+# put extracted coordinates in a df
+longlat_df <- data.frame(longitude = as.vector(longitude), latitude=as.vector(latitude))
+#crs(longlat_df) <- "+proj=longlat +datum=WGS84"
+california_map <- ggplot2::map_data("state", region = "california") #for base map
+
+# plot coordinates on a map for overall WRF data
+ggplot() + geom_polygon(data = california_map, aes(x = long, y = lat, group = group), fill = "grey", color = "black") +
+  geom_point(data = longlat_df, aes(x = longitude, y = latitude), color = "darkred", size = 1) +
+  theme_bw() + labs(x = "Longitude", y = "Latitude", title = "Spatial Extent of Coordinates for Original File")
+
+# extract coordinates for cropped
+nc_file <- nc_open("/Users/grace/rprojects/wrf_project/crop_files/crop_wrf.dlytotal.precip.1988.nc")
+latitude <- ncvar_get(nc_file, "XLAT")
+longitude <- ncvar_get(nc_file, "XLONG")
+nc_close
+
+# put extracted coordinates in a df
+longlat_df <- data.frame(longitude = as.vector(longitude), latitude=as.vector(latitude))
+#crs(longlat_df) <- "+proj=longlat +datum=WGS84"
+california_map <- map_data("state", region = "california") #for base map
+
+
+# plot coordinates on a map
+ggplot() + geom_polygon(data = california_map, aes(x = long, y = lat, group = group), fill = "grey", color = "black") +
+  geom_point(data = longlat_df, aes(x = longitude, y = latitude), color = "darkred", size = 1) +
+  theme_bw() + labs(x = "Longitude", y = "Latitude", title = "Spatial Extent of Coordinates for Cropped File for Sedgwick Basin Extent")
+
+# for seeing the Sedgwick basin
+# get basin extent and plot
+plot = T
+basin = rast("/Users/grace/rprojects/wrf_project/SWbasin_AvgFire")
+basin_vect = as.polygons(basin)
+
+# projection for wrf netcdf data is: CHECK THIS, IS PROBSBLY DIFFERENT FROM WILL'S
+basin_vect_unproj = project(basin_vect, "+proj=longlat +datum=WGS84 +no_defs ")
+if (plot) {plot(basin_vect_unproj)}
+basin_extent = ext(basin_vect_unproj)
+
+# explicit data type checks for the raster I'm using
+crs(basin)
+ext(basin)
+res(basin)
+nlyr(basin)
+crs(basin_vect)
+```
+
+## Crop netCDF data to the extent of the basin of the watershed
+
+Create extent for basin
+```{r, process grid met}
+# give example climate files to iterate through - this is just for testing
+#clim_files = list.files(path = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/tmax/test/",pattern = "\\.nc$", full.names = T)
+
+# ------------------------------ CROP + PROCESS NETCDF CLIMATE DATA USING BASIN EXTENT AND NCO -----------------------------
+
+# FOR NETCDF TO WORK WITH RHESSYS:
+#   Must use 'time' as temporal dimension, below we change every instance of 'day' to 'time' to be safe
+#   Must have variable as floating point/double data type, NOT INTEGER
+
+basin = rast("/Users/grace/rprojects/wrf_project/SWbasin_AvgFire")
+
+basin_vect = as.polygons(basin)
+basin_vect_latlon = project(basin_vect, "EPSG:4326")
+
+basin_extent = ext(basin_vect_latlon)
+# cell size is 4 km, buffer should be at least 3 km at most latitudes 
+# so should cover the centroids of netcdf cells not completely inside basin
+# Charles' WRF is 2km spatial resolution, so halving what Will did
+basin_extent_buffer = extend(basin_extent, 0.015)
+
+# this should be in lon lat wgs84 to match ncdf - see xy axes
+if (plot) {
+  plot(basin_extent_buffer)
+  plot(basin_extent,add=T)
+  plot(basin_vect_latlon,add=T)
+}
+
+basin_extent = basin_extent_buffer
+```
+
+Loop through the climate variables to crop (run four or five times depending on variables needed)
+```{r, windspeed and crop}
+# specify the paths for each of the 5 variable types
+dly_prcp_path = "/Users/grace/rprojects/wrf_project/dly_prec"
+dly_relhum_path = "/Users/grace/rprojects/wrf_project/dly_relhum"
+#windmax_path = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/windmax"
+tmax_path = "/Users/grace/rprojects/wrf_project/dly_tmax"
+tmin_path = "/Users/grace/rprojects/wrf_project/dly_tmin"
+
+# Destination folder for cropped files
+clim_dest = "/Users/grace/rprojects/wrf_project/crop_files"
+
+# process each climate variable type separately
+# update this for each of the 5 variable types
+clim_files = list.files(path = tmin_path, pattern = "\\.nc$", full.names = T)
+
+# Loop through climate files
+for (infile in clim_files) {
+  
+  outfile <- paste0(file.path(clim_dest, "crop_"), basename(infile))
+  
+  # Define the longitude and latitude bounds from the basin_extent (plus buffer) defined above
+  lon_min <- xmin(basin_extent)
+  lon_max <- xmax(basin_extent)
+  lat_min <- ymin(basin_extent)
+  lat_max <- ymax(basin_extent)
+  
+  # Build cropping command using cdo sellonlatbox based on basin_extent
+  crop_cmd <- paste0("cdo sellonlatbox,", lon_min, ",", lon_max, ",", lat_min, ",", lat_max, " ", infile, " ", outfile)
+  system(crop_cmd)
+  
+  # Check if the cropped file was successfully created
+  if (!file.exists(outfile)) {
+    cat("Error: Cropping failed for", infile, "\n")
+    next  # Skip to the next file if cropping failed
+  }
+  
+  cat("Successfully cropped:", infile, "->", outfile, "\n")
+  
+  # Open the cropped NetCDF file
+  nc <- nc_open(outfile)
+  
+  # Get variable names
+  var_names <- names(nc$var)
+  nc_close(nc)
+  
+  # If there are no variables, skip processing
+  if (length(var_names) == 0) {
+    cat("Warning: No valid variables found in", infile, "\n")
+    next
+  }
+  
+  # Special handling for wind files (compute wind speed from U and V components)
+  if (grepl("wind", infile) && all(c("U", "V") %in% var_names)) {
+    nc <- nc_open(outfile, write = TRUE)
+    
+    u_component <- ncvar_get(nc, "U")
+    v_component <- ncvar_get(nc, "V")
+    wind_speed <- sqrt(u_component^2 + v_component^2)
+    
+    # Create a new variable in the NetCDF file for wind speed
+    wind_def <- ncvar_def("wind_speed", "m/s", nc$dim)
+    nc_outfile <- paste0(file.path(clim_dest, "wind_speed_"), basename(outfile))
+    nc_create(nc_outfile, list(dim_def = nc$dim, var_def = wind_def))
+    
+    nc_out <- nc_open(nc_outfile, write = TRUE)
+    ncvar_put(nc_out, "wind_speed", wind_speed)
+    nc_close(nc_out)
+    
+    cat("Processed wind speed:", infile, "->", nc_outfile, "\n")
+    nc_close(nc)
+  }
+  
+  # Convert each variable in the NetCDF file to double precision
+  for (var in var_names) {
+    ncap_cmd <- paste0("ncap2 -O -s '", var, "=double(", var, ")' ", outfile, " ", outfile)
+    system(ncap_cmd)
+  }
+  
+  # Print confirmation
+  cat("Processed:", infile, "->", outfile, "\n")
+}
+```
+
+## Unit check prior to conversion
+Precipitation: precsum, range 0-891.165; mm
+Relative humidity: rhmean, range 4.707718-100; %
+Wind speed max: maxspeed, range 3.833371-16.79659; idk
+Temperature maximum: airtmax, range 258.0816-317.1882; K
+Temperature minimum: airtmin, range 251.7519-305.2329; K
+```{r, check variable names and units within wrf files}
+# files that need to be converted, check
+dly_prcp_file = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/dly_prec/wrf.dlytotal.precip.1988.nc"
+dly_relhum_file = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/dly_relhum/wrf.dlymean.rh2m.1988.nc"
+windmax_file = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/windmax/wrf.dmax.wind10m.1999-07-01.nc"
+tmax_file = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/tmax/wrf.dlymax.airt2m.1988.nc"
+tmin_file = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/tmin/wrf.dlymin.airt2m.1988.nc"
+
+nc = nc_open(dly_relhum_file)
+var_name = names(nc$var)[3]   # gets the variable name
+var_name
+
+var_values = ncvar_get(nc, var_name)
+var_range = range(var_values, na.rm = TRUE) 
+cat("min:", var_range[1], "max:", var_range[2], "\n")
+nc_close(nc)
+
+var_name = names(nc$var)[2]   # gets the variable name
+var_name
+
+names(nc$var)
+```
+
+Convert the units from netCDF files into needed format for RHESSys base station. 
+```{r, convert units for cropped .nc files}
+# Function to convert NetCDF data and save in a new folder
+convert_nc_units <- function(nc_file, output_folder) {
+  
+  # Open NetCDF file
+  nc <- nc_open(nc_file, write = FALSE)  # Open in read-only mode
+  
+  # Extract variable name
+  var_name <- names(nc$var)[1]
+  data <- ncvar_get(nc, var_name)
+  
+  # Define output file path in the new folder
+  output_file <- file.path(output_folder, basename(nc_file))
+  
+  # Determine conversion based on file name
+  if (grepl("dlymax.airt2m", nc_file)) {
+    data <- data - 273.15  # Convert K to °C
+    cat("Converted air temperature from K to °C:", nc_file, "\n")
+  } else if (grepl("dlymin.airt2m", nc_file)) {
+    data <- data - 273.15  # Convert K to °C
+    cat("Converted air temperature from K to °C:", nc_file, "\n")
+  } else if (grepl("dlytotal.precip", nc_file)) {
+    data <- data / 1000  # Convert mm to m
+    cat("Converted precipitation from mm to m:", nc_file, "\n")
+  } else if (grepl("dmax.wind10m", nc_file)) {
+    cat("Wind data does not require conversion:", nc_file, "\n")
+  }
+  
+  # Close original NetCDF file
+  nc_close(nc)
+  
+  # Copy original file to the new directory before modification
+  file.copy(nc_file, output_file, overwrite = TRUE)
+  
+  # Reopen copied NetCDF file in write mode to modify it
+  nc_out <- nc_open(output_file, write = TRUE)
+  
+  # Update variable with converted data
+  ncvar_put(nc_out, var_name, data)
+  
+  # Close modified NetCDF file
+  nc_close(nc_out)
+  
+  cat("Saved converted file to:", output_file, "\n")
+}
+
+# Define input and output paths
+crop_path = "/Users/grace/rprojects/wrf_project/crop_files"
+output_path = "/Users/grace/rprojects/wrf_project/crop_files_converted"
+
+# Ensure output folder exists
+if (!dir.exists(output_path)) {
+  dir.create(output_path, recursive = TRUE)
+}
+
+# Get list of NetCDF files to process
+nc_files = list.files(path = crop_path, pattern = "\\.nc$", full.names = TRUE)
+
+# loop through files and convert
+for (file in nc_files) {
+  convert_nc_units(file, output_path)
+}
+```
+
+## Upscale data from 2m resolution to 30m resolution - not working ?
+```{r}
+# set the factor needed, in this case we need a factor of 45 as the original resolution is 2m and the desired resolution is 90m
+target_res = 30
+
+# set input files and new output directory
+input_path <- "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/crop_files_converted"
+output_path <- "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/aggregated_files1"
+
+# ensure output folder exists
+if (!dir.exists(output_path)) {
+  dir.create(output_path, recursive = TRUE)
+}
+
+# get list of NetCDF files to process
+nc_files = list.files(path = input_path, pattern = "\\.nc$", full.names = TRUE)
+
+# Loop through files
+for (file_path in nc_files) {
+  message("Processing: ", basename(file_path))
+  
+  # Load file
+  r <- rast(file_path)
+  
+  # Get original resolution (assumes square cells)
+  orig_res <- res(r)[1]
+  
+  # Calculate aggregation factor (round to nearest integer)
+  agg_factor <- round(target_res / orig_res)
+  
+  if (agg_factor < 1) {
+    message("File already coarser than target resolution — skipping aggregation.")
+    r_agg <- r
+  } else {
+    # Aggregate spatially
+    r_agg <- aggregate(r, fact = agg_factor, fun = mean, na.rm = TRUE)
+  }
+  
+  # Save new file
+  out_file <- file.path(output_path, paste0("agg", target_res, "m_", basename(file_path)))
+  writeCDF(r_agg, out_file, overwrite = TRUE)
+  
+  message("Saved: ", out_file)
+}
+```
+
+Debugging aggregation - resolution seems to be working?
+```{r}
+# checking against original script that just aggregated automatically to 90 and didn't work super great
+f = "/Volumes/mambo_hd/Sedgwick/wrf/netcdf/crop_files_converted/crop_wrf.dlymax.airt2m.1988.nc"
+r = rast(f)
+
+res(r)
+ext(r)
+ncell(r)
+crs(r)
+
+# Load original and aggregated
+r_orig <- rast("/Volumes/mambo_hd/Sedgwick/wrf/netcdf/crop_files_converted/crop_wrf.dlymax.airt2m.1988.nc")
+r_agg  <- rast("/Volumes/mambo_hd/Sedgwick/wrf/netcdf/aggregated_files/agg90m_crop_wrf.dlymax.airt2m.1988.nc")
+
+# Get centroids of each cell (just for the first layer to simplify)
+centroids_orig <- as.points(r_orig[[1]])
+centroids_agg  <- as.points(r_agg[[1]])
+
+# Plot comparison
+plot(ext(r_orig), col = "lightgrey", main = "Cell Centroids Comparison")
+points(centroids_orig, pch = 1, col = "blue", cex = 0.5)
+points(centroids_agg, pch = 3, col = "red", cex = 0.7)
+legend("topright", legend = c("Original (Blue)", "Aggregated (Red)"), pch = c(1,3))
+```
+
+Debugging -- centroid and value output sanity check
+```{r}
+# File path
+# checking a correctly cropped and converted value to see if that is the spatial issue
+nc_path <- "/Users/grace/rprojects/wrf_project/crop_files/crop_wrf.dlytotal.precip.1988.nc"
+
+# Read NetCDF as a SpatRaster
+r <- rast(nc_path)
+
+# If multiple time steps, calculate mean precipitation over the year
+r_mean <- mean(r, na.rm = TRUE)
+
+# Convert raster to data frame with coordinates
+df <- as.data.frame(r_mean, xy = TRUE)
+colnames(df) <- c("lon", "lat", "precip")
+
+# Remove NA values
+df <- df %>% filter(!is.na(precip))
+
+# Plot 1: centroids only
+p1 <- ggplot(df, aes(x = lon, y = lat)) +
+  geom_point(size = 0.8, color = "blue") +
+  coord_equal() +
+  labs(title = "Centroids of Aggregated NetCDF Grid",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal()
+
+# Plot 2: climate variable distribution
+p2 = ggplot(df, aes(x = lon, y = lat, color = precip)) +
+  geom_point(size = 1) +
+  scale_color_viridis_c(name = "clim var", option = "plasma") +
+  coord_equal() +
+  labs(title = "Climate Variable Distribution Example",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal()
+
+# Print plots
+print(p1)
+print(p2)
+```
+
+## Consolidate into single .nc files
+```{r}
+# takes originally converted files -- trying something new
+input_dir <- "/Users/grace/rprojects/wrf_project/crop_files_converted"
+
+# Output folder to write merged .nc files
+output_dir <- "/Users/grace/rprojects/wrf_project/merged_files"
+
+# ensure output folder exists
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Define the variable types you expect to process
+vars <- c("dlymax.airt2m", "dlymin.airt2m", "dlytotal.precip", "dlymean.rh2m") #, "dmax.wind10m")  
+
+# ---- Merge loop ----
+
+for (v in vars) {
+  message("Merging variable: ", v)
+ 
+  # Get list of files for that variable
+  files <- list.files(input_dir, pattern = paste0(v, ".*\\.nc$"), full.names = TRUE)
+ 
+  # Sort by year using the number in the filename (assumes 4-digit year)
+  files <- files[order(as.numeric(stringr::str_extract(files, "\\d{4}")))]
+ 
+  # Read and stack all rasters
+  r_list <- lapply(files, rast)
+  r_stack <- rast(r_list)  # creates multilayer time stack
+ 
+  # Output file name
+  out_file <- file.path(output_dir, paste0(v, "_final.nc"))
+ 
+  # Write to NetCDF
+  writeCDF(r_stack, out_file, overwrite = TRUE)
+ 
+  message("Saved to: ", out_file)
+}
+```
+
+## Make the base station from cleaned .nc files
+Make the base station itself - C code and R script mainly from Will
+```{r, make base station}
+# Requires
+#   - createbaseinfo_netcdf.c compiled binary
+# 
+# Inputs:
+#   - Processed/edited/subset aggregated (through time), netcdf climate data, processed in chunk above
+#   - Basin and DEM raster maps
+
+plots = T
+
+# ------------------------------ INPUTS ------------------------------
+# uncompiled source of the createbaseinfo_netcdf.c code
+ncbase_src = "/Users/grace/rprojects/wrf_project/createbaseinfo_netcdf.c"
+
+# USE SAME BASIN RASTER AS PRIOR
+basin = rast("/Users/grace/rprojects/wrf_project/SWbasin_AvgFire") 
+DEM = rast("/Users/grace/rprojects/wrf_project/SWdem30m.tif") #digital elevation model
+
+# location for maps to be used with base station creation
+map_dest = "/Users/grace/rprojects/wrf_project/netcdfmaps"
+
+# where to output a new zone map based on Netcdf grid
+zone_dest = "/Users/grace/rprojects/wrf_project/preprocessing_newzone"
+
+# specify climate files individually or via pattern, USE PROCESSED CLIMATE INPUTS FROM PREVIOUS SCRIPT 
+clim_files_final = list.files(path = "/Users/grace/rprojects/wrf_project/merged_files", pattern = "\\.nc$", full.names = T)
+
+# ------------------------------ END INPUTS ------------------------------
+
+# for later use
+basin_vect = as.polygons(basin)
+basin_vect_latlon = project(basin_vect, "EPSG:4326")
+
+# ------------------------------ GET GRID MAP FROM NETCDF ------------------------------
+# there are slight differences between getting the grid from the metadata elevation map and the 
+# netcdf already clipped using NCO. Using the clipped data from NCO as a default for now, but 
+# could easily be better the other way, code should be easy to toggle
+
+# commentary above is from will and I am just going to use the grid from my clipped climate net cdf files
+
+# ---------- Grid from clipped climate netcdf files ----------
+grid_from_clim = T
+if (grid_from_clim) {
+  # read in netcdf as raster, get only 1 day of precip
+  nc_grid_lonlat = rast(clim_files_final[1])[[1]]
+  # set values to sequential, change name
+  values(nc_grid_lonlat) = seq_along(values(nc_grid_lonlat))
+  names(nc_grid_lonlat) = "ID"
+  
+  # project to utm, mask to get zone/basestation map
+  nc_grid = project(nc_grid_lonlat, basin, method="near") #will's original line
+  
+  # resample basin back to new grid (so extents align for masking) -- this didn't work
+  #basin_resampled = resample(basin, nc_grid, method="near")
+  
+  # mask
+  id_grid = mask(nc_grid, basin)
+}
+
+# --------------- output the zone grid for use in preprocessing ---------------
+# maps need to be based on the netcdf latlong grid resolution + extent
+zone = mask(x = id_grid_proj, mask = basin) # will had x=id_grid_proj, replacing with id_grid didn't work
+writeRaster(id_grid, file.path(zone_dest, "zone_ids.tif"), overwrite=T)
+
+# ------------------------------ GENERATE INPUTS FOR NETCDF BASE STATION CREATION  ------------------------------
+# maps need to be based on the netcdf latlong grid resolution + extent
+demproj = project(DEM, "EPSG:4326")
+dem_nc = resample(demproj, nc_grid_lonlat, method="average")
+# LAI
+lai_nc = dem_nc
+values(lai_nc) = 3.0
+names(lai_nc) = "lai"
+
+if (!file.exists(map_dest)) {
+  dir.create(map_dest)
+}
+
+writeRaster(dem_nc, filename = file.path(map_dest,"dem.asc"), filetype="AAIGrid", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+writeRaster(lai_nc, filename = file.path(map_dest,"lai.asc"), filetype="AAIGrid", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+writeRaster(nc_grid_lonlat, filename = file.path(map_dest,"cellid.asc"), filetype="AAIGrid", datatype =  "INT4S", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+file.remove(list.files(path = map_dest, pattern = ".prj|.aux.xml", full.names = T))
+
+# format: ID ID Y X X Y
+
+xyid_loc = cbind(1:nrow(crds(nc_grid_lonlat)), 1:nrow(crds(nc_grid_lonlat)), crds(nc_grid_lonlat)[,c("y","x")], crds(nc_grid_lonlat))
+write.table(xyid_loc, file.path(map_dest,"xyid_loc.txt"), row.names = F, col.names = F)
+
+# ------------------------------ RUN C BIN TO GET BASE STATION  ------------------------------
+# COMPILE
+system(noquote(paste("bash -c \"", paste0("gcc ", ncbase_src, " -o ", file.path(map_dest,"create_netcdfbase")), "\"", sep = "")))
+
+# RUN -- YOU MAY NEED TO EDIT THIS, command should look like: ./create_netcdfbase cellid.asc lai.asc dem.asc xyid_loc.txt clim/ netcdf.base
+cmd = paste0(file.path(map_dest,"create_netcdfbase"), " ", file.path(map_dest,"cellid.asc"), " ", file.path(map_dest,"lai.asc"), " ",
+             file.path(map_dest,"dem.asc"), " ", file.path(map_dest,"xyid_loc.txt"), " ", dirname(clim_files_final[1]), "/ ", file.path(map_dest,"netcdf.base"))
+system(noquote(paste("bash -c \"",cmd ,"\"", sep = "")))
+```
+
+Chat GPT using DEM to create base station map
+```{r}
+# load in what you just created
+dem = raster("/Users/grace/rprojects/wrf_project/netcdfmaps_final/dem.asc")
+lai = raster("/Users/grace/rprojects/wrf_project/netcdfmaps_final/lai.asc")
+cellid = raster("/Users/grace/rprojects/wrf_project/netcdfmaps_final/cellid.asc")
+basin = raster("/Users/grace/rprojects/wrf_project/SWbasin_AvgFire")
+
+# reproject DEM and cellid
+dem_utm = projectRaster(dem, basin, method="bilinear")  # continuous data -> bilinear
+writeRaster(dem_utm, "/Users/grace/rprojects/wrf_project/netcdfmaps_final/dem_utm.tif", overwrite=TRUE)
+
+# load text ID 
+id_df = read.table("/Users/grace/rprojects/wrf_project/netcdfmaps_final/xyid_loc.txt", header=FALSE)
+colnames(id_df) = c("zone_id", "id_dup", "y", "x", "y_dup", "x_dup")
+id_df = id_df[, c("x", "y", "zone_id")] # keep only what we need
+
+# convert text file to spatial points -- this didn't work
+# coordinates(id_df) = ~x+y
+# proj4string(id_df) = crs("+proj=longlat +datum=WGS84")  # match DEM projection
+# rasterize zone IDs, using basin as template to match extent, resolution, and CRS
+# netcdf_msk = rasterize(id_df, dem, field="zone_id", fun="first")
+# save raster
+# writeRaster(netcdf_msk, "/Users/grace/rprojects/wrf_project/netcdfmaps_final/netcdf_msk.tif", format="GTiff", overwrite=TRUE)
+
+# convert to terra vector, rasterize to netCDF grid
+# id_vect = vect(id_df, geom=c("x","y"), crs="EPSG:4326")  # WGS84
+# zone_raster = rasterize(id_vect, nc_grid_lonlat, field="zone_id", touches=TRUE)
+# 
+# # mask using basin
+# basin = rast("/Users/grace/rprojects/wrf_project/SWbasin_AvgFire")
+# basin_ll = project(basin, "EPSG:4326")  # project basin to lat/lon
+# basin_resampled <- resample(basin_ll, zone_raster, method="near")
+# zone_masked = mask(zone_raster, basin_resampled)
+# 
+# writeRaster(zone_masked, 
+#             filename = "/Users/grace/rprojects/wrf_project/netcdfmaps_final/zone_masked.tif", 
+#             filetype = "GTiff", overwrite = TRUE)
+
+# check visually
+plot(dem, main="DEM with NetCDF Zone Overlay and Basin Outline")
+plot(netcdf_msk, add=TRUE, col=rainbow(230))
+
+# create a data.frame linking patches to climate zone (optional) -- worldfile
+# this apparently replaces the GRASS/basin2worldfile but the output didn't make sense
+# patch_ids <- cellid
+# 
+# ## ensure values are aligned
+# if (!all(dim(netcdf_msk) == dim(patch_ids))) {
+#   patch_ids <- resample(patch_ids, netcdf_msk, method="ngb")
+# }
+# 
+# worldfile <- data.frame(
+#   patch_id = getValues(patch_ids),
+#   zone_id  = getValues(netcdf_msk)
+# )
+# worldfile <- worldfile[!is.na(worldfile$patch_id), ]
+# 
+# # Save CSV
+# write.csv(worldfile, "/Users/grace/rprojects/wrf_project/netcdfmaps_final/worldfile.csv", row.names=FALSE)
+
+# Rasterize in WGS84 (same CRS as points)
+netcdf_msk_wgs <- rasterize(id_df, dem, field="zone_id", fun="first")
+
+# Reproject to UTM using nearest neighbor
+netcdf_msk_utm_2 <- projectRaster(netcdf_msk_wgs, basin, method="ngb")
+writeRaster(netcdf_msk_utm_2, "/Users/grace/rprojects/wrf_project/netcdfmaps_final/netcdf_msk_utm_2.tif", overwrite=TRUE)
+
+id_vect <- vect(id_df) 
+# Transform from WGS84 to NAD83 / UTM zone 10N
+id_vect_utm <- project(id_vect, crs(basin))  # terra handles datum shift
+
+# Optional: check bounding box
+ext(id_vect_utm)
+ext(basin)
+```
+
+This code below is from Will but I'm not sure what edits the Sedgwick WRF base station will need just yet -- none of this is in use it is just hanging out in orbit down below
+```{r}
+# ------------------------------ EDIT/FIX BASE STATION  ------------------------------
+
+varnames = rep(NA, length(clim_files_trim))
+for (i in seq_along(clim_files_trim)) {
+  tmp = nc_open(clim_files_trim[i])
+  varnames[i] = names(tmp$var)
+}
+
+ncbase = read.table(file.path(map_dest,"netcdf.base"))
+
+ncbase[ncbase[,2]=="year_start_index", 1] = "1900"
+
+ncbase[ncbase[,2]=="netcdf_tmax_filename", 1] = clim_files[grepl("tmmx", clim_files)]
+ncbase[ncbase[,2]=="netcdf_var_tmax", 1] = varnames[grepl("tmmx", clim_files)]
+
+ncbase[ncbase[,2]=="netcdf_tmin_filename", 1] = clim_files[grepl("tmmn", clim_files)]
+ncbase[ncbase[,2]=="netcdf_var_tmin", 1] = varnames[grepl("tmmn", clim_files)]
+
+ncbase[ncbase[,2]=="netcdf_rain_filename", 1] = clim_files[grepl("pr", clim_files)]
+ncbase[ncbase[,2]=="netcdf_var_rain", 1] = varnames[grepl("pr", clim_files)]
+
+ncbase[ncbase[,2]=="netcdf_huss_filename", 1] = clim_files[grepl("daily_mean_specific_humidity", varnames)]
+ncbase[ncbase[,2]=="netcdf_var_huss", 1] = varnames[grepl("daily_mean_specific_humidity", varnames)]
+
+ncbase[ncbase[,2]=="netcdf_rmax_filename", 1] = clim_files[grepl("rmax", clim_files)]
+ncbase[ncbase[,2]=="netcdf_var_rmax", 1] = varnames[grepl("rmax", clim_files)]
+
+ncbase[ncbase[,2]=="netcdf_rmin_filename", 1] = clim_files[grepl("rmin", clim_files)]
+ncbase[ncbase[,2]=="netcdf_var_rmin", 1] = varnames[grepl("rmin", clim_files)]
+
+ncbase[ncbase[,2]=="netcdf_rsds_filename", 1] = clim_files[grepl("daily_mean_shortwave_radiation_at_surface", varnames)]
+ncbase[ncbase[,2]=="netcdf_var_rsds", 1] = varnames[grepl("daily_mean_shortwave_radiation_at_surface", varnames)]
+
+ncbase[ncbase[,2]=="netcdf_was_filename", 1] = clim_files[grepl("daily_mean_wind_speed", varnames)]
+ncbase[ncbase[,2]=="netcdf_var_was", 1] = varnames[grepl("daily_mean_wind_speed", varnames)]
+
+write.table(ncbase, file.path(map_dest,"netcdf.base"), row.names = F, col.names = F, quote = F)
+```
+
+```{r}
+library(terra)
+
+# -------------------------------
+# Inputs
+# -------------------------------
+nc_file  <- "/Users/grace/rprojects/wrf_project/dly_tmin/wrf.dlymin.airt2m.1994.nc"        
+basin    <- rast("//Users/grace/rprojects/wrf_project/SWbasin_AvgFire") 
+
+# -------------------------------
+# Load NetCDF
+# -------------------------------
+r <- rast(nc_file)
+
+# Sanity check
+print(r)
+# dimensions should be [rows, cols, time]
+
+# -------------------------------
+# Reduce time dimension
+# -------------------------------
+# OPTION A: mean over the year (most common)
+r_year <- app(r, fun = mean, na.rm = TRUE)
+
+r_proj <- project(r_year, basin, method = "bilinear")
+
+# -------------------------------
+# Clip to basin
+# -------------------------------
+r_clip <- mask(r_proj, basin)
+
+# -------------------------------
+# Save + visualize
+# -------------------------------
+#writeRaster(r_clip, out_tif, overwrite = TRUE)
+
+plot(r_clip, main = "Average annual relative humidity in Sedgwick")
+#plot(basin, add = TRUE, border = "black")
+```
+
