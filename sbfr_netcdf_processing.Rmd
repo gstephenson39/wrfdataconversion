@@ -1,0 +1,386 @@
+---
+title: "SBFR netCDF pre-processing and spatial base station creation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load libraries
+```{r, warning=FALSE, results=FALSE}
+library(ncdf4)
+library(raster)
+library(sp)
+library(sf)
+library(maps)
+library(terra)
+library(sp)
+library(ggplot2)
+library(tidyverse)
+library(FNN)
+```
+
+# SBFR
+
+## build a lon/lat raster to convert WRF coordinates
+```{r, reproject basin}
+# define and reproject Sedgwick basin
+basin = rast("/Users/grace/rprojects/wrf_project/basin_sbfr.tiff")
+basin_vect = as.polygons(basin, dissolve = TRUE, na.rm = TRUE)
+basin_ll <- project(basin_vect, "EPSG:4326")
+
+# pull WRF grid geometry directly by dimension name
+get_wrf_geom <- function(nc_path) {
+  nc <- nc_open(nc_path)
+  on.exit(nc_close(nc))
+  lon <- ncvar_get(nc, "XLONG")
+  lat <- ncvar_get(nc, "XLAT")
+  dn  <- sapply(nc$var[["XLONG"]]$dim, function(d) d$name) # c("south_north","west_east")
+  n_sn <- nc$dim[["south_north"]]$len
+  n_we <- nc$dim[["west_east"]]$len
+  
+  # ncvar_get preserves the file's declared dimension order, so reshape using dn, not an assumption
+  dim(lon) <- if (dn[1] == "south_north") c(n_sn, n_we) else c(n_we, n_sn)
+  dim(lat) <- dim(lon)
+  if (dn[1] != "south_north") { lon <- t(lon); lat <- t(lat) } # normalize to [south_north, west_east]
+  list(lon = lon, lat = lat, n_sn = n_sn, n_we = n_we)
+}
+
+# choose example file (any one WRF file works -- grid geometry is assumed static across years/vars)
+geom <- get_wrf_geom("/Users/grace/rprojects/wrf_project/dly_prec/wrf.dlytotal.precip.1988.nc")
+
+# flatten with explicit south_north (iy) / west_east (ix) row/col indices
+wrf_pts <- data.frame(
+  lon = as.vector(geom$lon),
+  lat = as.vector(geom$lat),
+  iy  = rep(seq_len(geom$n_sn), times = geom$n_we),  # south_north index (row)
+  ix  = rep(seq_len(geom$n_we), each  = geom$n_sn)    # west_east index (col)
+)
+head(wrf_pts)
+
+# convert to terra spatial vector, for a visual basin-overlap sanity check only
+wrf_vect <- vect(wrf_pts, geom = c("lon", "lat"), crs = "EPSG:4326")
+wrf_sub <- wrf_vect[basin_ll]
+plot(wrf_sub, pch = ".", cex = 0.3)
+plot(basin_ll, add = TRUE, border = "darkblue", lwd = 2)
+```
+
+## build the regridding table
+```{r}
+# cover the basin's bounding box (in lon/lat) with a small buffer at original WRF resolution
+res_deg <- median(c(diff(sort(unique(round(wrf_pts$lat, 5))))[1:20],
+                    diff(sort(unique(round(wrf_pts$lon, 5))))[1:20]), na.rm = TRUE)
+
+buf_deg <- res_deg * 2
+target_ext <- ext(basin_ll) + buf_deg
+target_grid <- rast(target_ext, resolution = res_deg, crs = "EPSG:4326")
+
+# centroid of every target cell
+target_pts <- as.points(target_grid, na.rm = FALSE)
+target_xy  <- crds(target_pts)
+
+# nearest WRF source point for every target cell (true geographic nearest-neighbor, not index-based)
+nn <- FNN::get.knnx(data = as.matrix(wrf_pts[, c("lon","lat")]),
+                     query = target_xy, k = 1)
+nearest_idx <- nn$nn.index[, 1]   # row into wrf_pts for each target cell, in target-grid cell order
+
+# keep the ix/iy pair each target cell should pull from, reshaped to the target raster's own layout
+map_ix <- wrf_pts$ix[nearest_idx]
+map_iy <- wrf_pts$iy[nearest_idx]
+```
+
+## process the climate data files
+The goal of this chunk is to reprocess all of the climate data to ensure that the variables are in the unit and scale expected by the createbasestation.c file and RHESSys itself. 
+
+### create regridding function and function to convert units
+```{r}
+# build regridding function
+regrid_wrf_var <- function(nc_file, varname, target_grid, map_ix, map_iy,
+                            is_cumulative = FALSE,
+                            convert = c("none", "K_to_C", "mm_to_m")) {
+  convert <- match.arg(convert)
+
+  nc <- nc_open(nc_file)
+  on.exit(nc_close(nc))
+  arr <- ncvar_get(nc, varname)            
+  dn  <- sapply(nc$var[[varname]]$dim, function(d) d$name)
+  time_pos <- which(dn == "times")
+  arr <- aperm(arr, c(which(dn == "south_north"), which(dn == "west_east"), time_pos)) # force [iy, ix, time]
+
+  n_time <- dim(arr)[3]
+  n_target <- length(map_ix)
+
+  out_vals <- matrix(NA_real_, nrow = n_target, ncol = n_time)
+  for (t in seq_len(n_time)) {
+    slice <- arr[, , t]                       # [iy, ix]
+    out_vals[, t] <- slice[cbind(map_iy, map_ix)]
+  }
+
+  # cumulative -> daily happens before unit conversion. It doesn't matter for
+  # precip (mm_to_m is linear, so diff() then divide == divide then diff()),
+  # but keeping this order is the safer default if a cumulative variable that
+  # needs a non-linear conversion is ever added.
+  if (is_cumulative) out_vals <- t(apply(out_vals, 1, function(x) c(x[1], diff(x))))
+
+  out_vals <- switch(convert,
+    none    = out_vals,
+    K_to_C  = out_vals - 273.15,
+    mm_to_m = out_vals / 1000
+  )
+
+  # reassemble into the target raster's cell order, one layer per day
+  layers <- lapply(seq_len(n_time), function(t) {
+    r <- target_grid
+    values(r) <- out_vals[, t]
+    r
+  })
+  r_out <- rast(layers)
+
+  times_raw <- ncvar_get(nc, "times")
+  time_units <- ncatt_get(nc, "times", "units")$value
+  origin <- sub("days since ", "", time_units)
+  time(r_out) <- as.Date(origin) + times_raw
+  names(r_out) <- format(time(r_out), "wrf_day_%Y%m%d")
+  r_out
+}
+```
+
+### convert and regrid daily cumulative precipitation data
+```{r, precip data}
+# convert precipitation data
+prec_dir <- "/Users/grace/rprojects/wrf_project/dly_prec"
+basin_nc_dir  <- "/Users/grace/rprojects/wrf_project/sbfr_dly_prec_basin"
+if(!dir.exists(basin_nc_dir)) dir.create(basin_nc_dir)
+prec_files <- list.files(prec_dir, pattern = "\\.nc$", full.names = TRUE)
+
+all_prec <- lapply(prec_files, regrid_wrf_var, varname = "precsum",
+                    target_grid = target_grid, map_ix = map_ix, map_iy = map_iy,
+                    is_cumulative = TRUE)
+
+r_basin <- rast(all_prec) # concatenate all years along time
+r_basin <- mask(r_basin, basin_ll) # drop cells outside the basin polygon
+
+# sanity check: pick the basin cell nearest the centroid and plot its time series
+plot(r_basin[[100]], main = "Regridded precip, one day", col = hcl.colors(50, "Blues"))
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+
+ts_vec <- as.numeric(r_basin[cellFromXY(r_basin, crds(centroids(basin_ll)))])
+plot(ts_vec, type = "l", xlab = "Day", ylab = "Precip (mm)", main = "One basin cell, all days")
+sum(is.na(ts_vec))
+
+# save so terra and the C program can both use it
+# now has a real CRS and real 1-D lon/lat dims 
+writeRaster(r_basin, file.path(basin_nc_dir, "wrf_prec_basin.nc"), overwrite = TRUE, filetype = "netcdf")
+```
+
+### convert and regrid temperature maximum data
+```{r, tmax data}
+# convert tmax data
+tmax_dir <- "/Users/grace/rprojects/wrf_project/dly_tmax"
+basin_nc_dir  <- "/Users/grace/rprojects/wrf_project/sbfr_dly_tmax_basin"
+if(!dir.exists(basin_nc_dir)) dir.create(basin_nc_dir)
+tmax_files <- list.files(tmax_dir, pattern = "\\.nc$", full.names = TRUE)
+
+# go over all files
+all_tmax <- lapply(tmax_files, regrid_wrf_var, varname = "airtmax",
+                    target_grid = target_grid, map_ix = map_ix, map_iy = map_iy,
+                    is_cumulative = FALSE) # all variables other than precip are daily, not cumulative
+
+r_basin <- rast(all_tmax) # concatenate all years along time
+r_basin <- mask(r_basin, basin_ll) # drop cells outside the basin polygon
+
+# sanity check
+plot(r_basin[[100]], main = "Regridded air temperature max, one day", col = hcl.colors(50, "Blues"))
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+ts_vec <- as.numeric(r_basin[cellFromXY(r_basin, crds(centroids(basin_ll)))])
+plot(ts_vec, type = "l", xlab = "Day", ylab = "", main = "One basin cell, all days")
+sum(is.na(ts_vec))
+
+# save so terra and the C program can both use it
+writeRaster(r_basin, file.path(basin_nc_dir, "wrf_tmax_basin.nc"), overwrite = TRUE, filetype = "netcdf")
+```
+
+### convert and regrid temperature minimum data
+```{r, tmax data}
+# convert tmax data
+tmin_dir <- "/Users/grace/rprojects/wrf_project/dly_tmin"
+basin_nc_dir  <- "/Users/grace/rprojects/wrf_project/sbfr_dly_tmin_basin"
+if(!dir.exists(basin_nc_dir)) dir.create(basin_nc_dir)
+tmin_files <- list.files(tmin_dir, pattern = "\\.nc$", full.names = TRUE)
+
+# go over all files
+all_tmin <- lapply(tmin_files, regrid_wrf_var, varname = "airtmin",
+                    target_grid = target_grid, map_ix = map_ix, map_iy = map_iy,
+                    is_cumulative = FALSE) # all variables other than precip are daily, not cumulative
+
+r_basin <- rast(all_tmin) # concatenate all years along time
+r_basin <- mask(r_basin, basin_ll) # drop cells outside the basin polygon
+
+# sanity check
+plot(r_basin[[100]], main = "Regridded air temperature minimum, one day", col = hcl.colors(50, "Blues"))
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+
+ts_vec <- as.numeric(r_basin[cellFromXY(r_basin, crds(centroids(basin_ll)))])
+plot(ts_vec, type = "l", xlab = "Day", ylab = "", main = "One basin cell, all days")
+
+# save so terra and the C program can both use it
+writeRaster(r_basin, file.path(basin_nc_dir, "wrf_tmin_basin.nc"), overwrite = TRUE, filetype = "netcdf")
+```
+
+### convert and regrid relative humidity data
+```{r, relhum data}
+# convert tmax data
+rh_dir <- "/Users/grace/rprojects/wrf_project/dly_relhum"
+basin_nc_dir  <- "/Users/grace/rprojects/wrf_project/sbfr_dly_relhum_basin"
+if(!dir.exists(basin_nc_dir)) dir.create(basin_nc_dir)
+rh_files <- list.files(rh_dir, pattern = "\\.nc$", full.names = TRUE)
+
+# go over all files
+all_rh <- lapply(rh_files, regrid_wrf_var, varname = "rhmean",
+                    target_grid = target_grid, map_ix = map_ix, map_iy = map_iy,
+                    is_cumulative = FALSE) # all variables other than precip are daily, not cumulative
+
+r_basin <- rast(all_rh) # concatenate all years along time
+r_basin <- mask(r_basin, basin_ll) # drop cells outside the basin polygon
+
+# sanity check
+plot(r_basin[[100]], main = "Regridded relative humidity, one day", col = hcl.colors(50, "Blues"))
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+ts_vec <- as.numeric(r_basin[cellFromXY(r_basin, crds(centroids(basin_ll)))])
+plot(ts_vec, type = "l", xlab = "Day", ylab = "", main = "One basin cell, all days")
+
+# save so terra and the C program can both use it
+writeRaster(r_basin, file.path(basin_nc_dir, "wrf_relhum_basin.nc"), overwrite = TRUE, filetype = "netcdf")
+```
+
+### convert and regrid maximum wind speed data
+```{r, windspeed data}
+# convert windspeed data
+maxwind_dir <- "/Users/grace/rprojects/wrf_project/dly_winds"
+basin_nc_dir  <- "/Users/grace/rprojects/wrf_project/sbfr_dly_winds_basin"
+if(!dir.exists(basin_nc_dir)) dir.create(basin_nc_dir)
+windmax_files <- list.files(maxwind_dir, pattern = "\\.nc$", full.names = TRUE)
+
+# go over all files
+all_windmax <- lapply(windmax_files, regrid_wrf_var, varname = "u10max",
+                    target_grid = target_grid, map_ix = map_ix, map_iy = map_iy,
+                    is_cumulative = FALSE) # all variables other than precip are daily, not cumulative
+
+r_basin <- rast(all_windmax) # concatenate all years along time
+r_basin <- mask(r_basin, basin_ll) # drop cells outside the basin polygon
+
+# sanity check
+plot(r_basin[[100]], main = "Regridded maximum daily wind speed, one day", col = hcl.colors(50, "Blues"))
+plot(basin_ll, add = TRUE, border = "red", lwd = 2)
+ts_vec <- as.numeric(r_basin[cellFromXY(r_basin, crds(centroids(basin_ll)))])
+plot(ts_vec, type = "l", xlab = "Day", ylab = "", main = "One basin cell, all days")
+sum(is.na(ts_vec))
+
+# save so terra and the C program can both use it
+writeRaster(r_basin, file.path(basin_nc_dir, "wrf_winds_basin.nc"), overwrite = TRUE, filetype = "netcdf")
+```
+
+## Make the base station from cleaned .nc files
+Make the base station itself - C code and R script mainly from Will
+```{r, make base station}
+# Requires
+#   - createbaseinfo_netcdf.c compiled binary
+# 
+# Inputs:
+#   - Processed/edited/subset aggregated (through time), netcdf climate data, processed in chunk above
+#   - Basin and DEM raster maps
+
+plots = T
+
+# ------------------------------ INPUTS ------------------------------
+# uncompiled source of the createbaseinfo_netcdf.c code
+ncbase_src = "/Users/grace/rprojects/wrf_project/createbaseinfo_netcdf.c"
+
+# USE SAME BASIN RASTER AS PRIOR
+basin = rast("/Users/grace/rprojects/wrf_project/basin_sbfr.tiff") 
+DEM = rast("/Users/grace/rprojects/wrf_project/dem30m_SBFRbox.tiff") #digital elevation model
+
+# location for maps to be used with base station creation
+map_dest = "/Users/grace/rprojects/wrf_project/sbfr_netcdfmaps"
+
+# where to output a new zone map based on Netcdf grid
+zone_dest = "/Users/grace/rprojects/wrf_project/sbfr_preprocessing_newzone"
+
+# specify climate files individually or via pattern, USE PROCESSED CLIMATE INPUTS FROM PREVIOUS SCRIPT 
+clim_files_final = list.files(path = "/Users/grace/rprojects/wrf_project/sbfr_merged_files", pattern = "\\.nc$", full.names = T)
+
+# ------------------------------ END INPUTS ------------------------------
+
+# for later use
+basin_vect = as.polygons(basin)
+basin_vect_latlon = project(basin_vect, "EPSG:4326")
+
+# ------------------------------ GET GRID MAP FROM NETCDF ------------------------------
+# there are slight differences between getting the grid from the metadata elevation map and the 
+# netcdf already clipped using NCO. Using the clipped data from NCO as a default for now, but 
+# could easily be better the other way, code should be easy to toggle
+
+# commentary above is from will and I am just going to use the grid from my clipped climate net cdf files
+
+# ---------- Grid from clipped climate netcdf files ----------
+grid_from_clim = T
+if (grid_from_clim) {
+  # read in netcdf as raster, get only 1 day of precip
+  nc_grid_lonlat = rast(clim_files_final[1])[[1]]
+  # set values to sequential, change name
+  values(nc_grid_lonlat) = seq_along(values(nc_grid_lonlat))
+  names(nc_grid_lonlat) = "ID"
+  
+  # project to utm, mask to get zone/basestation map
+  nc_grid = project(nc_grid_lonlat, basin, method="near") #will's original line
+  
+  # resample basin back to new grid (so extents align for masking) -- this didn't work
+  #basin_resampled = resample(basin, nc_grid, method="near")
+  
+  # mask
+  id_grid = mask(nc_grid, basin)
+}
+
+# --------------- output the zone grid for use in preprocessing ---------------
+# maps need to be based on the netcdf latlong grid resolution + extent
+#zone = mask(x = id_grid_proj, mask = basin) # will had x=id_grid_proj, replacing with id_grid didn't work
+#writeRaster(id_grid, file.path(zone_dest, "zone_ids.tif"), overwrite=T)
+
+# ------------------------------ GENERATE INPUTS FOR NETCDF BASE STATION CREATION  ------------------------------
+# maps need to be based on the netcdf latlong grid resolution + extent
+demproj = project(DEM, "EPSG:4326")
+dem_nc = resample(demproj, nc_grid_lonlat, method="average")
+# LAI
+lai_nc = dem_nc
+values(lai_nc) = 3.0
+names(lai_nc) = "lai"
+
+if (!file.exists(map_dest)) {
+  dir.create(map_dest)
+}
+
+writeRaster(dem_nc, filename = file.path(map_dest,"dem.asc"), filetype="AAIGrid", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+writeRaster(lai_nc, filename = file.path(map_dest,"lai.asc"), filetype="AAIGrid", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+writeRaster(nc_grid_lonlat, filename = file.path(map_dest,"cellid.asc"), filetype="AAIGrid", datatype =  "INT4S", gdal = c("FORCE_CELLSIZE=TRUE"), NAflag=-9999, overwrite=T)
+
+file.remove(list.files(path = map_dest, pattern = ".prj|.aux.xml", full.names = T))
+
+# format: ID ID Y X X Y
+
+xyid_loc = cbind(1:nrow(crds(nc_grid_lonlat)), 1:nrow(crds(nc_grid_lonlat)), crds(nc_grid_lonlat)[,c("y","x")], crds(nc_grid_lonlat))
+
+write.table(xyid_loc, file.path(map_dest,"xyid_loc.txt"), row.names = F, col.names = F)
+
+# ------------------------------ RUN C BIN TO GET BASE STATION  ------------------------------
+# COMPILE
+system(noquote(paste("bash -c \"", paste0("gcc ", ncbase_src, " -o ", file.path(map_dest,"create_netcdfbase")), "\"", sep = "")))
+
+# RUN -- YOU MAY NEED TO EDIT THIS, command should look like: ./create_netcdfbase cellid.asc lai.asc dem.asc xyid_loc.txt clim/ netcdf.base
+cmd = paste0(file.path(map_dest,"create_netcdfbase"), " ", file.path(map_dest,"cellid.asc"), 
+             " ", file.path(map_dest,"lai.asc"), " ",
+             file.path(map_dest,"dem.asc"), " ", file.path(map_dest,"xyid_loc.txt"), 
+             " ", dirname(clim_files_final[1]), "/ ", file.path(map_dest,"netcdf.base"))
+
+system(noquote(paste("bash -c \"",cmd ,"\"", sep = "")))
+```
